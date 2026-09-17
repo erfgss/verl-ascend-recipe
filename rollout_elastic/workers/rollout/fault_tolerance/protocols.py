@@ -46,3 +46,4 @@ class LoadBalancerProtocol(Protocol):
     mark_failed: RemoteCallable
     add_servers: RemoteCallable
     remove_servers: RemoteCallable
+    set_fault_tolerance: RemoteCallable

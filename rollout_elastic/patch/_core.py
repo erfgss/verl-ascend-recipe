@@ -26,11 +26,12 @@ Three primitives are provided:
   receives the original implementation as its first argument.
 
 All patchers are idempotent: a method that has already been patched (its
-``_orig_<name>`` slot exists) is left untouched on re-import.
+``_orig_<name>`` slot exists on that class) is left untouched on re-import.
 
-``@ray.remote``-decorated classes are handled transparently: the decorators
-unwrap ``ActorClass`` to its ``__ray_actor_class__`` before patching, so the
-same call site works for plain and Ray-actor classes.
+For ``@ray.remote``-decorated classes, these helpers only modify the underlying
+plain class. The area module must then recreate the ActorClass from that class
+and rebind its consumers before any actor is started. Existing Ray wrappers and
+method metadata cannot be updated by changing the original class alone.
 """
 
 from __future__ import annotations
@@ -44,8 +45,8 @@ def unwrap_ray_remote(cls: type) -> type:
 
     ``@ray.remote class Foo`` rebinds ``Foo`` to an ``ActorClass`` object whose
     methods cannot be ``setattr``-ed directly. Ray keeps the original class at
-    ``ActorClass.__ray_actor_class__``, so we patch that instead — the actor
-    serializes the same class object when ``Foo.remote()`` is called.
+    ``ActorClass.__ray_actor_class__``. Patching it does not refresh the existing
+    ActorClass; callers must reconstruct and publish the actor after patching.
     """
     return getattr(cls, "__ray_actor_class__", cls)
 
@@ -55,7 +56,7 @@ def _mark_patched(cls: type, name: str) -> None:
 
 
 def _is_patched(cls: type, name: str) -> bool:
-    return hasattr(cls, f"_orig_{name}")
+    return f"_orig_{name}" in cls.__dict__
 
 
 def patch(cls: type, name: Optional[str] = None) -> Callable[[Callable], Callable]:

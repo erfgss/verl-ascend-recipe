@@ -13,9 +13,9 @@
 # limitations under the License.
 """Patch ``verl.workers.rollout.llm_server`` for elastic inference.
 
-This area extends the four native classes of ``llm_server.py``:
+This area replaces the LB actor and extends the native client/manager classes:
 
-- ``GlobalRequestLoadBalancer`` (Ray actor): rewritten as a thin forwarder over
+- ``ElasticGlobalRequestLoadBalancer`` (recipe-owned Ray actor): forwards to
   the recipe-owned ``_LoadBalancerCore`` state machine (kept in
   ``fault_tolerance.load_balancer``), which adds fault tolerance
   (``mark_failed``, dead-set routing) and real ``add_servers`` /
@@ -29,14 +29,15 @@ This area extends the four native classes of ``llm_server.py``:
   ``RolloutProgressStoreActor``, and can spawn replacement replicas
   (``spawn_replacement`` / ``_reclaim_ray_resources``).
 
-``_LoadBalancerCore`` and ``RetryLLMServerClient`` are brand-new classes and are
-kept as recipe files under ``fault_tolerance``; everything else is expressed as
-decorators against the native classes.
+The LB actor is defined completely before Ray decorates it. The core and retry
+client live under ``fault_tolerance``; native clients and the manager are extended
+through decorators.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import socket
@@ -52,7 +53,6 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.llm_server import (
     DEFAULT_ROUTING_CACHE_SIZE,
     FullyLLMServerClient,
-    GlobalRequestLoadBalancer,
     LLMServerClient,
     LLMServerManager,
 )
@@ -62,84 +62,82 @@ from ._core import add, patch, wrap
 
 logger = logging.getLogger(__name__)
 
+
+def _read_ft_enabled(config: Any) -> bool:
+    """Read the FT master switch; missing config keys mean disabled."""
+    try:
+        return bool(config.async_training.fault_tolerance.enabled)
+    except (AttributeError, KeyError):
+        return False
+
+
+def _native_when_ft_disabled(cls):
+    """Dispatch before recipe tracing; capture this class's own native method."""
+    native = cls.generate
+
+    def decorate(ft_generate):
+        @functools.wraps(ft_generate)
+        async def generate(self, *args, **kwargs):
+            if not self._ft_enabled():
+                return await native(self, *args, **kwargs)
+            return await ft_generate(self, *args, **kwargs)
+
+        return generate
+
+    return decorate
+
+
 # ---------------------------------------------------------------------------
-# GlobalRequestLoadBalancer (Ray actor) — thin forwarder over _LoadBalancerCore
+# Recipe-owned LB actor — all methods are defined before Ray wraps the class
 # ---------------------------------------------------------------------------
 
-_ORIG_LB = "_rollout_elastic_lb_core"
 
+@ray.remote
+class ElasticGlobalRequestLoadBalancer:
+    """Global routing and fault state shared by all recipe clients."""
 
-@wrap(GlobalRequestLoadBalancer, "__init__")
-def _lb_init(
-    orig,
-    self,
-    servers: dict[str, ray.actor.ActorHandle],
-    max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
-    enable_fault_tolerance: bool = False,
-):
-    """Initialize the LB around the recipe-owned ``_LoadBalancerCore``."""
-    from verl.workers.rollout.fault_tolerance.load_balancer import _LoadBalancerCore
-
-    orig(self, servers, max_cache_size=max_cache_size)
-    self._core = _LoadBalancerCore(
-        servers=servers,
-        max_cache_size=max_cache_size,
-        enable_fault_tolerance=enable_fault_tolerance,
-    )
-    setattr(self, _ORIG_LB, True)
-
-
-def _lb_core(self):
-    core = getattr(self, _ORIG_LB, None)
-    if core is None:
-        # Safety net for actors constructed before the patch was installed.
+    def __init__(
+        self,
+        servers: dict[str, ray.actor.ActorHandle],
+        max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
+        enable_fault_tolerance: bool = False,
+    ) -> None:
         from verl.workers.rollout.fault_tolerance.load_balancer import _LoadBalancerCore
 
-        core = _LoadBalancerCore(servers=self._server)
-        setattr(self, _ORIG_LB, core)
-    return core
+        self._core = _LoadBalancerCore(
+            servers=servers,
+            max_cache_size=max_cache_size,
+            enable_fault_tolerance=enable_fault_tolerance,
+        )
+        logger.warning(
+            "[FT] Elastic LB initialized: pid=%s host=%s servers=%s ft=%s",
+            os.getpid(),
+            socket.gethostname(),
+            list(servers),
+            enable_fault_tolerance,
+        )
 
+    def acquire_server(self, request_id: str) -> str:
+        return self._core.acquire_server(request_id)
 
-@patch(GlobalRequestLoadBalancer, "acquire_server")
-def acquire_server(self, request_id: str) -> str:
-    """Acquire a server for the given request, skipping dead servers."""
-    return _lb_core(self).acquire_server(request_id)
+    def release_server(self, server_id: str) -> None:
+        self._core.release_server(server_id)
 
+    def mark_failed(self, server_id: str) -> None:
+        self._core.mark_failed(server_id)
+        logger.warning("[FT] Elastic LB mark_failed completed: server_id=%s", server_id)
 
-@patch(GlobalRequestLoadBalancer, "release_server")
-def release_server(self, server_id: str) -> None:
-    """Release a server after a request completes, decrementing its inflight count."""
-    _lb_core(self).release_server(server_id)
+    def set_fault_tolerance(self, enabled: bool) -> None:
+        self._core.set_fault_tolerance(enabled)
 
+    def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
+        self._core.add_servers(servers)
 
-@add(GlobalRequestLoadBalancer, "mark_failed")
-def mark_failed(self, server_id: str) -> None:
-    """Mark a server as dead; subsequent acquires skip it. Idempotent."""
-    _lb_core(self).mark_failed(server_id)
+    def remove_servers(self, server_ids: list[str]) -> None:
+        self._core.remove_servers(server_ids)
 
-
-@add(GlobalRequestLoadBalancer, "set_fault_tolerance")
-def set_fault_tolerance(self, enabled: bool) -> None:
-    """Enable or disable fault tolerance for the load balancer."""
-    _lb_core(self)._ft = bool(enabled)
-
-
-@patch(GlobalRequestLoadBalancer, "add_servers")
-def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
-    """Add new servers to the server handles. Idempotent; resurrects dead ids."""
-    _lb_core(self).add_servers(servers)
-
-
-@patch(GlobalRequestLoadBalancer, "remove_servers")
-def remove_servers(self, server_ids: list[str]) -> None:
-    """Remove servers from the server handles."""
-    _lb_core(self).remove_servers(server_ids)
-
-
-@add(GlobalRequestLoadBalancer, "get_server_handle")
-def get_server_handle(self, server_id: str):
-    """Return the Ray actor handle for ``server_id``, or None if unknown."""
-    return _lb_core(self).get_server_handle(server_id)
+    def get_server_handle(self, server_id: str):
+        return self._core.get_server_handle(server_id)
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +166,7 @@ def _client_init(
 @add(LLMServerClient, "_ft_enabled")
 def _ft_enabled(self) -> bool:
     """Whether the fault-tolerance master switch is on for this config."""
-    try:
-        return bool(self.config.async_training.fault_tolerance.enabled)
-    except (AttributeError, KeyError):
-        return False
+    return _read_ft_enabled(self.config)
 
 
 @add(LLMServerClient, "_ft_call_timeout_s")
@@ -190,6 +185,40 @@ def _ft_max_request_retries(self) -> int:
         return int(self.config.async_training.fault_tolerance.max_request_retries)
     except (AttributeError, KeyError):
         return 3
+
+
+@add(LLMServerClient, "_resolve_original_max_tokens")
+def _resolve_original_max_tokens(self, original_prompt: list[int]) -> Optional[int]:
+    """
+    Agent loops never put max_tokens/max_new_tokens in sampling_params, so the
+    budget must come from the config for token continuation (abort resume /
+    checkpoint resume) to have a well-defined remaining budget. Returns None
+    when the rollout config is unavailable.
+    """
+    try:
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        raw = min(
+            rollout_cfg.response_length,
+            rollout_cfg.prompt_length + rollout_cfg.response_length - len(original_prompt),
+        )
+    except (AttributeError, KeyError, TypeError):
+        return None
+    raw = int(raw)
+    if self.max_model_len is not None:
+        raw = min(raw, self.max_model_len - len(original_prompt))
+    return max(0, raw)
+
+
+@add(LLMServerClient, "_generation_budget_key")
+def _generation_budget_key(self) -> str:
+    """Sampling-params key the client pins the generation budget under.
+
+    The server (patch/vllm.py) accepts both max_tokens and max_new_tokens;
+    the client always writes this single key so token-continuation
+    bookkeeping (checkpoint resume, budget decrement) stays unambiguous.
+    Override in a subclass to adapt to another server dialect.
+    """
+    return "max_tokens"
 
 
 @add(LLMServerClient, "_call_server")
@@ -276,6 +305,9 @@ async def _generate_once(
 
 @patch(LLMServerClient, "_acquire_server")
 async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    if not self._ft_enabled():
+        return await self._orig__acquire_server(request_id)
+
     server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
     handle = self._server_id_to_handle.get(server_id)
     if handle is None:
@@ -289,6 +321,9 @@ async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHa
 
 @patch(LLMServerClient, "_release_server")
 def _release_server(self, server_id: str) -> None:
+    if not self._ft_enabled():
+        return self._orig__release_server(server_id)
+
     # Fire-and-forget: release is just a counter decrement, no need to await.
     # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
     try:
@@ -300,14 +335,18 @@ def _release_server(self, server_id: str) -> None:
 
 @add(LLMServerClient, "_mark_server_failed")
 async def _mark_server_failed(self, server_id: str) -> None:
-    """Fire-and-forget notify LB that a server is dead. Must never block."""
+    """Notify LB with a bounded wait; log failures without propagating them."""
+    if not self._ft_enabled():
+        return
+
     try:
         await asyncio.wait_for(self._load_balancer.mark_failed.remote(server_id=server_id), timeout=3.0)
     except Exception:
-        logger.warning("[FT] _mark_server_failed: mark server %s failed", server_id)
+        logger.exception("[FT] LB mark_failed RPC failed: server_id=%s", server_id)
 
 
 @patch(LLMServerClient, "generate")
+@_native_when_ft_disabled(LLMServerClient)
 @rollout_trace_op
 async def generate(
     self,
@@ -408,6 +447,7 @@ def _model_version_policy(self):
 
 
 @patch(FullyLLMServerClient, "generate")
+@_native_when_ft_disabled(FullyLLMServerClient)
 @rollout_trace_op
 async def _fully_generate(
     self,
@@ -434,14 +474,19 @@ async def _fully_generate(
     max_retries = self._ft_max_request_retries()
 
     original_prompt = normalize_token_ids(prompt_ids)
-    original_sampling = copy.deepcopy(sampling_params)
 
-    limit_key = None
-    if "max_tokens" in sampling_params:
-        limit_key = "max_tokens"
-    elif "max_new_tokens" in sampling_params:
-        limit_key = "max_new_tokens"
-    original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+    sampling_params = dict(sampling_params)
+    budget_key = self._generation_budget_key()
+    original_max_tokens = self._resolve_original_max_tokens(original_prompt)
+    if original_max_tokens is not None:
+        sampling_params[budget_key] = original_max_tokens
+    else:
+        logger.warning(
+            "[FT] FullyLLMServerClient: cannot resolve generation budget from rollout config; "
+            "token continuation will fall back to the server-side per-attempt default "
+            "(each attempt may re-earn a full response_length)"
+        )
+    original_sampling = copy.deepcopy(sampling_params)
 
     final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
     min_global_steps, max_global_steps, global_steps = None, None, None
@@ -476,11 +521,12 @@ async def _fully_generate(
             except Exception as e:
                 if not is_transient_fault(e):
                     raise
-                print(
-                    f"FullyLLMServerClient: progress store unavailable"
-                    f"({type(e).__name__}), degrading to fresh attempt"
-                    f"(run={self._run_id}, recovery_id={recovery_id})",
-                    flush=True,
+                logger.warning(
+                    "[FT] FullyLLMServerClient: progress store unavailable (%s), "
+                    "degrading to fresh attempt (run=%s, recovery_id=%s)",
+                    type(e).__name__,
+                    self._run_id,
+                    recovery_id,
                 )
                 prefix_for_call = original_prompt
                 call_sampling = sampling_params
@@ -489,12 +535,22 @@ async def _fully_generate(
                 progress_ctx = ProgressContext(checkpoint=checkpoint)
                 prefix_for_call = checkpoint.resume_prefix_token_ids()
                 call_sampling = copy.deepcopy(original_sampling)
-                if limit_key is not None:
-                    call_sampling[limit_key] = checkpoint.remaining_max_tokens()
+                if original_max_tokens is not None:
+                    call_sampling[budget_key] = checkpoint.remaining_max_tokens()
                 # Seed final_output with inherited cumulative so that after fault reset
                 # (where final_output was cleared) the persisted tokens are not lost.
                 # On the abort path this is idempotent (cumulative == existing final_output).
                 if checkpoint.inherited_prefix_len > 0:
+                    logger.warning(
+                        "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
+                        "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
+                        checkpoint.inherited_prefix_len,
+                        self._run_id,
+                        recovery_id,
+                        checkpoint.attempt_id,
+                        len(prefix_for_call),
+                        call_sampling.get(budget_key),
+                    )
                     final_output = TokenOutput(
                         token_ids=list(checkpoint.cumulative_token_ids),
                         log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
@@ -526,7 +582,26 @@ async def _fully_generate(
             retries += 1
             total_llm_generate_attempts += 1
             if retries >= max_retries:
+                logger.warning(
+                    "[FT] prompt retries exhausted: request_id=%s failed_server=%s "
+                    "retries=%d/%d (attempts=%d), raising AllServersFailed",
+                    current_request_id,
+                    e.server_id,
+                    retries,
+                    max_retries,
+                    total_llm_generate_attempts,
+                )
                 raise AllServersFailed(f"FullyLLMServerClient: retries exhausted after {retries} attempts") from None
+            logger.warning(
+                "[FT] prompt retry %d/%d: server %s failed (%s: %s) for request_id=%s, "
+                "resetting to original prompt and retrying on a fresh server",
+                retries,
+                max_retries,
+                e.server_id,
+                type(e.cause).__name__ if e.cause is not None else "server-fault",
+                e.cause,
+                current_request_id,
+            )
             final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
             sampling_params = copy.deepcopy(original_sampling)
             min_global_steps, max_global_steps, global_steps = None, None, None
@@ -574,10 +649,10 @@ async def _fully_generate(
         max_global_steps = global_steps
         model_weight_version = global_steps
 
-        # 3. update max_new_tokens; truncate (FT only) to the original budget
-        if original_max_tokens is not None and limit_key is not None:
+        # 3. update the generation budget; truncate (FT only) to the original budget
+        if original_max_tokens is not None:
             if not progress_on:
-                sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
+                sampling_params[budget_key] = original_max_tokens - len(final_output.token_ids)
             if len(final_output.token_ids) >= original_max_tokens:
                 if ft_on and len(final_output.token_ids) > original_max_tokens:
                     final_output.token_ids = final_output.token_ids[:original_max_tokens]
@@ -594,12 +669,30 @@ async def _fully_generate(
             pass
         if output.stop_reason not in ("aborted", "abort") or not partial_rollout_enabled:
             break
+        logger.warning(
+            "[FT] partial rollout aborted, resuming generation with %d generated tokens "
+            "(request_id=%s, attempt=%d, next_prefix_len=%d)",
+            len(output.token_ids),
+            current_request_id,
+            total_llm_generate_attempts,
+            len(prefix_for_call) + len(output.token_ids),
+        )
 
     final_output.extra_fields["global_steps"] = global_steps
     final_output.extra_fields["min_global_steps"] = min_global_steps
     final_output.extra_fields["max_global_steps"] = max_global_steps
     final_output.extra_fields["llm_generate_attempts"] = total_llm_generate_attempts
     final_output.extra_fields["llm_generate_retries"] = retries
+    if retries > 0 or total_llm_generate_attempts > 1:
+        logger.warning(
+            "[FT] FullyLLMServerClient.generate completed after recovery: request_id=%s "
+            "attempts=%d retries=%d tokens=%d stop_reason=%s",
+            request_id,
+            total_llm_generate_attempts,
+            retries,
+            len(final_output.token_ids),
+            final_output.stop_reason,
+        )
     return final_output
 
 
@@ -654,19 +747,35 @@ async def _init_progress_store(self, progress_cfg) -> None:
     await self._progress_store.init.remote(progress_cfg)
 
 
+@add(LLMServerManager, "_ft_enabled")
+def _manager_ft_enabled(self) -> bool:
+    """Select the LB and client implementation from the same master switch."""
+    return _read_ft_enabled(self.config)
+
+
 @patch(LLMServerManager, "_init_global_load_balancer")
 async def _init_global_load_balancer(self) -> None:
-    ft_on = False
+    if not self._ft_enabled():
+        await self._orig__init_global_load_balancer()
+        return
+
     try:
-        ft_on = bool(self.config.async_training.fault_tolerance.enabled)
-    except (AttributeError, KeyError):
-        pass
-    self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        node_id = ray.get_runtime_context().get_node_id()
+        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+    except Exception:
+        scheduling_strategy = None
+    options: dict[str, Any] = {"max_restarts": 3, "max_task_retries": 3}
+    if scheduling_strategy is not None:
+        options["scheduling_strategy"] = scheduling_strategy
+    self.global_load_balancer = ElasticGlobalRequestLoadBalancer.options(**options).remote(
         servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+        enable_fault_tolerance=True,
     )
-    if ft_on:
-        await self.global_load_balancer.set_fault_tolerance.remote(True)
+    # Surface actor initialization failures before returning the manager.
+    await self.global_load_balancer.set_fault_tolerance.remote(True)
 
 
 @patch(LLMServerManager, "get_client")
@@ -675,8 +784,11 @@ def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServe
 
     Args:
         fully_async (bool): Whether to return the FullyLLMServerClient.
-        retry (bool): Whether to retry on server unavailability.
+        retry (bool): Whether to retry on server unavailability when FT is enabled.
     """
+    if not self._ft_enabled():
+        return self._orig_get_client(fully_async=fully_async)
+
     servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
     common = dict(
         config=self.config,

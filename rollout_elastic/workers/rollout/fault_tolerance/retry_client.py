@@ -101,22 +101,6 @@ class RetryLLMServerClient(LLMServerClient):
             pass
         return ModelVersionPolicy(mode="exact")
 
-    def _resolve_original_max_tokens(self, sampling_params: dict, original_prompt: list[int]) -> int:
-        if "max_tokens" in sampling_params:
-            raw = sampling_params["max_tokens"]
-        elif "max_new_tokens" in sampling_params:
-            raw = sampling_params["max_new_tokens"]
-        else:
-            rollout_cfg = self.config.actor_rollout_ref.rollout
-            raw = min(
-                rollout_cfg.response_length,
-                rollout_cfg.prompt_length + rollout_cfg.response_length - len(original_prompt),
-            )
-        raw = int(raw)
-        if self.max_model_len is not None:
-            raw = min(raw, self.max_model_len - len(original_prompt))
-        return max(0, raw)
-
     async def _weights_version(self) -> Optional[str]:
         if self._last_global_step is not None:
             return str(self._last_global_step)
@@ -163,7 +147,14 @@ class RetryLLMServerClient(LLMServerClient):
             call_sampling = original_sampling
             if progress_on:
                 sp_for_checkpoint = dict(original_sampling)
-                sp_for_checkpoint["max_tokens"] = self._resolve_original_max_tokens(original_sampling, original_prompt)
+                resolved = self._resolve_original_max_tokens(original_prompt)
+                if resolved is not None:
+                    sp_for_checkpoint[self._generation_budget_key()] = resolved
+                else:
+                    logger.warning(
+                        "[FT] RetryLLMServerClient: cannot resolve generation budget from rollout config; "
+                        "checkpoint continuation will treat the budget as unbounded"
+                    )
                 try:
                     result = await VLLMProgressCheckPoint.create_or_resume(
                         store=self._progress_store,
@@ -178,30 +169,30 @@ class RetryLLMServerClient(LLMServerClient):
                 except Exception as e:
                     if not is_transient_fault(e):
                         raise
-                    print(
-                        f"RetryLLMServerClient: progress store unavailable"
-                        f"({type(e).__name__}), degrading to fresh attempt"
-                        f"(run={self._run_id}, recovery_id={recovery_id})",
-                        flush=True,
+                    logger.warning(
+                        "[FT] RetryLLMServerClient: progress store unavailable (%s), "
+                        "degrading to fresh attempt (run=%s, recovery_id=%s)",
+                        type(e).__name__,
+                        self._run_id,
+                        recovery_id,
                     )
                 else:
                     checkpoint = result.checkpoint
                     progress_ctx = ProgressContext(checkpoint=checkpoint)
                     prefix_for_call = checkpoint.resume_prefix_token_ids()
                     call_sampling = copy.deepcopy(original_sampling)
-                    call_sampling["max_tokens"] = checkpoint.remaining_max_tokens()
-                    logger.info(
-                        "[progress] run=%s, rid=%s, attempt=%d, outcome=%s, inherited_len=%d"
-                        "prefix_len=%d remaining_max_tokens=%d (%s)",
-                        self._run_id,
-                        recovery_id,
-                        result.attempt_id,
-                        result.outcome.name,
-                        result.inherited_prefix_len,
-                        len(prefix_for_call),
-                        checkpoint.remaining_max_tokens(),
-                        result.failure_detail or "-",
-                    )
+                    call_sampling[self._generation_budget_key()] = checkpoint.remaining_max_tokens()
+                    if result.inherited_prefix_len > 0:
+                        logger.warning(
+                            "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
+                            "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
+                            result.inherited_prefix_len,
+                            self._run_id,
+                            recovery_id,
+                            result.attempt_id,
+                            len(prefix_for_call),
+                            call_sampling.get(self._generation_budget_key()),
+                        )
             try:
                 output, server_id = await self._generate_once(
                     request_id,
@@ -222,15 +213,26 @@ class RetryLLMServerClient(LLMServerClient):
                     raise
                 retries += 1
                 if retries > max_retries:
+                    logger.warning(
+                        "[FT] prompt retries exhausted: request_id=%s failed_server=%s "
+                        "retries=%d/%d, raising AllServersFailed",
+                        request_id,
+                        e.server_id,
+                        retries,
+                        max_retries,
+                    )
                     raise AllServersFailed(
                         f"RetryLLMServerClient: retries exhausted after {retries} attempts"
                     ) from None
                 logger.warning(
-                    "RetryLLMServerClient: server %s failed (%s), retries %d/%d",
-                    e.server_id,
-                    type(e.cause).__name__ if e.cause is not None else "server-fault",
+                    "[FT] prompt retry %d/%d: server %s failed (%s: %s) for request_id=%s, "
+                    "resetting to original prompt and retrying on a fresh server",
                     retries,
                     max_retries,
+                    e.server_id,
+                    type(e.cause).__name__ if e.cause is not None else "server-fault",
+                    e.cause,
+                    request_id,
                 )
                 continue
 
@@ -261,6 +263,16 @@ class RetryLLMServerClient(LLMServerClient):
                 )
             else:
                 final = output
-            output.extra_fields["llm_generate_attempts"] = retries + 1
-            output.extra_fields["llm_generate_retries"] = retries
+            final.extra_fields["llm_generate_attempts"] = retries + 1
+            final.extra_fields["llm_generate_retries"] = retries
+            if retries > 0:
+                logger.warning(
+                    "[FT] RetryLLMServerClient.generate completed after recovery: request_id=%s "
+                    "attempts=%d retries=%d tokens=%d stop_reason=%s",
+                    request_id,
+                    retries + 1,
+                    retries,
+                    len(final.token_ids),
+                    final.stop_reason,
+                )
             return final
