@@ -91,21 +91,6 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
         fi
     done
 else
-    # ========== 子节点：读取主节点创建的目录 ==========
-    # 等待主节点写入 RUN_ID
-    while [ ! -f "${RUN_ID_FILE}" ]; do
-        echo "Waiting for master node to create run directory..."
-        sleep 2
-    done
-    
-    RUN_ID=$(cat "${RUN_ID_FILE}")
-    RUN_DIR="${LOG_BASE}/${RUN_ID}"
-    
-    # 设置本节点的 ascend_log
-    export ASCEND_PROCESS_LOG_PATH="${RUN_DIR}/${CURRENT_IP}/ascend_log"
-    mkdir -p "${ASCEND_PROCESS_LOG_PATH}"
-    echo "This node's ascend logs: ${ASCEND_PROCESS_LOG_PATH}"
-    
     # 子节点注册到 Ray
     while true; do
         ray start --address="$MASTER_ADDR:6766" \
