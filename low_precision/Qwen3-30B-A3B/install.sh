@@ -13,7 +13,7 @@ export COMPILE_CUSTOM_KERNELS=1
 python setup.py install
 cd ..
 
-echo "3. install Mgeatron-LM"
+echo "3. install Megatron-LM"
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
 git checkout core_v0.12.1
@@ -30,6 +30,7 @@ cd ..
 echo "5. install verl"
 git clone https://github.com/verl-project/verl
 cd verl
+git checkout 00cd5b44ec59b46a5d3ece5f9da41fdb01b890a8
 sed -i '/^triton-ascend==/ s/^/# /' requirements-npu.txt
 pip install -r requirements-npu.txt
 cd ..
@@ -41,4 +42,13 @@ pip install triton-ascend==3.2.2 --extra-index-url https://triton-ascend.osinfra
 
 echo "7. apply patch"
 cd Megatron-LM
-git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/Qwen3-30B-A3B/patch/megatron.patch && cd ..
+git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/Qwen3-30B-A3B/patch/megatron.patch
+cd ..
+cd verl
+git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/Qwen3-30B-A3B/patch/verl.patch
+cd ..
+
+echo "8. install MindStudio-Boost"
+pip install psutil
+dnf install -y numactl
+git clone -b verl https://gitcode.com/xnm-s83u/msboost_1088.git
