@@ -36,10 +36,6 @@ export TOKENIZERS_PARALLELISM=false
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}
 export ASCEND_VISIBLE_DEVICES=${ASCEND_VISIBLE_DEVICES:-0}
 
-# Some models are optimized by vllm ascend. While in some case, e.g. rlhf training,
-# the optimized model may not be suitable. In this case, set this value to 0 to disable the optimized model.
-export USE_OPTIMIZED_MODEL=0
-
 project_name=${project_name:-rloo_qwen3_8b_ascend}
 experiment_name=${experiment_name:-qwen3_8b_rloo_fsdp_1npu}
 
