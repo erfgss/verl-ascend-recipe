@@ -29,7 +29,6 @@
 | 组件 | 已验证版本或 revision |
 | --- | --- |
 | NPU | Ascend910_9382，64 GB HBM |
-| verl | `1a8a0f5ffd9d3f169ae4432b68526233ba028102`（`0.10.0.dev0`） |
 | PyTorch / torch-npu | `2.10.0+cpu` / `2.10.0.post4` |
 | vLLM | `0.23.0+empty` |
 | vLLM Ascend | `0.23.0` |
