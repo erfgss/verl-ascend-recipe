@@ -121,6 +121,7 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=True
     actor_rollout_ref.actor.megatron.param_offload=True
     actor_rollout_ref.actor.megatron.optimizer_offload=True
+    actor_rollout_ref.actor.megatron.grad_offload=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
@@ -223,5 +224,5 @@ python3 -m verl.trainer.main_ppo \
     "${ALGORITHM_CONFIG[@]}" \
     "${TRAINER_CONFIG[@]}" \
     "${EXTRA[@]}" \
-    2>&1 | tee logs/run_glm5_$(date -d '+8 hours' +%Y%m%d_%H%M%S).log.log \
+    2>&1 | tee logs/run_glm5_$(date -d '+8 hours' +%Y%m%d_%H%M%S).log \
     "$@" 

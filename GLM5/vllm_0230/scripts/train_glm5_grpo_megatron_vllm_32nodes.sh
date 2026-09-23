@@ -223,5 +223,5 @@ python3 -m verl.trainer.main_ppo \
     "${ALGORITHM_CONFIG[@]}" \
     "${TRAINER_CONFIG[@]}" \
     "${EXTRA[@]}" \
-    2>&1 | tee logs/run_glm5_$(date -d '+8 hours' +%Y%m%d_%H%M%S).log.log \
+    2>&1 | tee logs/run_glm5_$(date -d '+8 hours' +%Y%m%d_%H%M%S).log \
     "$@" 
