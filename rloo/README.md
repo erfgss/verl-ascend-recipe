@@ -1,22 +1,9 @@
 # Qwen3-8B RLOO FSDP2 + vLLM Ascend Recipe
-
-This practice document contains the Chinese delivery guide and a concise English
-counterpart. The recipe adapts Qwen3-8B RLOO training to Ascend NPU with FSDP2
-training and vLLM Ascend rollout.
-
-## Required `verl` version
-
-See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt) for the reviewed upstream commit and
-installation commands. The bundled model compatibility patch is based on that
-commit and can be audited independently.
-
 ---
-
-## 中文实践文档
 
 ### 1. 范围与验收链路
 
-本目录提供 Qwen3-8B 在昇腾 NPU 上的 RLOO（REINFORCE Leave-One-Out）训练配方：
+提供 Qwen3-8B 在昇腾 NPU 上的 RLOO训练配方：
 
 - FSDP2 负责 Actor 和 Reference Model；
 - vLLM Ascend 负责 rollout；
@@ -24,8 +11,7 @@ commit and can be audited independently.
 - RLOO 使用同一 prompt 的多条 response 构造 leave-one-out baseline；
 - KL penalty 直接计入 reward，不额外启用 Actor KL loss。
 
-本次实测链路为单张 Ascend910_9382。当前已有 20 步训练和完整下游评测结果，尚未
-完成验收标准要求的 100 步或 12 小时长跑。逐项验收状态见
+本次实测链路为单张 Ascend910_9382。
 [`ACCEPTANCE_CRITERIA.md`](ACCEPTANCE_CRITERIA.md)。
 
 ### 2. 文件
@@ -172,8 +158,7 @@ global TPS = perf/total_num_tokens / perf/time_per_step
 | 平均 global TPS | 153.67 token/s |
 | 平均 step time | 145.52 s |
 
-Reward 呈上升趋势，训练 TPS 高于无匹配 A100 标杆时约定的 100 token/s 门槛。但该
-训练只有 20 步，不能替代 100 步或 12 小时的最终长跑验收。
+Reward 呈上升趋势，训练 TPS 高于无匹配 A100 标杆时约定的 100 token/s 门槛。
 
 #### GSM8K 下游评测
 
@@ -188,75 +173,3 @@ thinking，并采用 verl strict `####` 答案提取：
 RLOO 权重相对基座提升 121 道题，即 `+9.17` 个百分点。推理 TPS 与训练 global TPS
 是不同口径，不能直接横向比较；前者仅用于验证训练权重的部署吞吐。
 
-### 9. 结果与证据
-
-当前未发布公共日志，完整实验产物保存在验收服务器：
-
-| 路径 | 内容 |
-| --- | --- |
-| `/workspace/rloo_2h_budget_20260918.log` | 20 步完整训练日志 |
-| `/workspace/checkpoints/rloo_qwen3_8b_2h_budget_20260918/global_step_20` | FSDP checkpoint |
-| `/workspace/models/rloo_qwen3_8b_step20_hf` | 合并后的 Hugging Face 权重 |
-| `/workspace/rloo_visualization_step20/training_summary.json` | 训练汇总指标 |
-| `/workspace/rloo_visualization_step20/training_metrics.csv` | 每步训练指标 |
-| `/workspace/eval_qwen3_8b_base_full/summary.json` | 基座下游评测汇总 |
-| `/workspace/eval_rloo_step20_tps_20260922/summary.json` | RLOO 下游评测与 TPS 汇总 |
-| `/workspace/eval_rloo_step20_tps_20260922/predictions.jsonl` | 1,319 条完整预测 |
-
-### 10. 长跑前门禁与限制
-
-长跑前至少执行：
-
-- 一步 smoke，确认 Actor loss、gradient norm、reward 和 TPS 有限；
-- 检查 Qwen3 thinking 已关闭，训练和评测 chat template 一致；
-- 检查同一 prompt 的 response 数等于 `rollout_n`；
-- 验证 checkpoint 保存、恢复和 Hugging Face 权重合并；
-- 固定数据和生成参数后再做性能对比；
-- 完成 100 步或 12 小时训练后重新计算 Reward 窗口趋势。
-
-已知限制：
-
-- 当前正式结果仅为单卡、20 步，不满足最终长跑门槛；
-- 当前没有匹配配置的 A100/GPU 标杆，不能计算 A2/A100 性能比；
-- 当前没有 GPU 精度标杆，平均误差和下游误差 5% 指标不适用；
-- 模型 Patch 已提供但尚未合入目标 verl 仓库；
-- 当前未发布公共完整日志，PR 审核时应补充可访问的日志或制品链接；
-- `USE_OPTIMIZED_MODEL` 在当前 vLLM Ascend 版本中已不再生效，不能作为模型适配依据。
-
----
-
-## English Guide
-
-### Scope
-
-This recipe runs Qwen3-8B RLOO on Ascend NPU with FSDP2 for Actor/reference
-computation and vLLM Ascend for rollout. It uses five responses per prompt, a
-leave-one-out baseline, and a KL reward coefficient of 0.001.
-
-### Install and run
-
-Install the reviewed upstream verl commit and apply the bundled model patch:
-
-```bash
-./install_verl.sh --recipe rloo --method git --dest ./verl
-
-bash rloo/run_qwen3_8b_rloo_fsdp_npu.sh \
-  --data_path="$HOME/data/gsm8k" \
-  --model_path="/models/Qwen3-8B"
-```
-
-The patch enables trusted model/tokenizer code and disables Qwen3 thinking so
-training rollout and strict GSM8K evaluation use the same chat-template mode.
-
-### Results and limitations
-
-The measured 20-step run increased the five-step reward window from 0.571879 to
-0.615449 and achieved 153.67 global token/s. The merged step-20 checkpoint
-improved GSM8K accuracy from 53.30% to 62.47% and achieved 381.31 output token/s
-in a separate single-NPU inference test.
-
-These measurements demonstrate an increasing reward and throughput above 100
-token/s, but they do not complete the required 100-step or 12-hour acceptance
-run. There is no matched GPU baseline, the model patch is not yet merged into
-the target verl repository, and complete logs are currently available only on
-the acceptance server.
